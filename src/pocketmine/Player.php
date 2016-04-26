@@ -186,6 +186,7 @@ class Player extends Human implements CommandSender, InventoryHolder, ChunkLoade
 
 	public $creationTime = 0;
 
+	protected $maxPickupableItems = 10; // 9 crafting, 1 held
 	/** @var Item[] */
 	protected $pickedupItems = [];
 
@@ -491,9 +492,9 @@ class Player extends Human implements CommandSender, InventoryHolder, ChunkLoade
 		return $this->perm->getEffectivePermissions();
 	}
 
-	public function addPickedupItem(Item $item) {
-		if (count($this->getPickedupItems()) > 5 and !$this->isCreative())
-			throw new \OutOfRangeException("Items array size cannot be greater than 5.");
+	public function addPickedupItem(Item $item, bool $ignoreItemCount = false) {
+		if (count($this->getPickedupItems()) >= $this->maxPickupableItems and !$this->isCreative() and !$ignoreItemCount)
+			throw new \OutOfRangeException("Items array size cannot be greater than {$this->maxPickupableItems}.");
 
 		$appended = false;
 
@@ -531,9 +532,9 @@ class Player extends Human implements CommandSender, InventoryHolder, ChunkLoade
 		unset($this->pickedupItems[$index]);
 	}
 
-	public function setPickedupItems(Array $items) {
-		if (count($items) > 5)
-			throw new \OutOfRangeException("Items array size must be 5.");
+	public function setPickedupItems(Array $items, bool $ignoreItemCount = false) {
+		if (count($items) > $this->maxPickupableItems and !$ignoreItemCount)
+			throw new \OutOfRangeException("Items array size must be {$this->maxPickupableItems}.");
 		$this->pickedupItems = $items;
 	}
 
@@ -2805,27 +2806,67 @@ class Player extends Human implements CommandSender, InventoryHolder, ChunkLoade
 					$this->dataPacket($pk);
 					break;
 				}
-
 				$recipe = $this->server->getCraftingManager()->getRecipe($packet->id);
-
 				if($recipe === null or (($recipe instanceof BigShapelessRecipe or $recipe instanceof BigShapedRecipe) and $this->craftingType === 0)){
 					$this->inventory->sendContents($this);
 					break;
 				}
-
 				foreach($packet->input as $i => $item){
 					if($item->getDamage() === -1 or $item->getDamage() === 0xffff){
 						$item->setDamage(null);
 					}
-
 					if($i < 9 and $item->getId() > 0){
 						$item->setCount(1);
 					}
 				}
-
 				$canCraft = true;
+				$giveItem = true;
+				// Keep a local copy so we can revert changes if needed
+				$pickedupItems = $this->getPickedupItems();
 
-				if($recipe instanceof ShapedRecipe){
+				if (empty($packet->input)) {
+					// Get a list of recipes that can be used to craft the result.
+					$recipes = $this->server->getCraftingManager()->getRecipesByItem($packet->output[0]);
+					// As soon as a recipe whose ingridients can be satisfied is found,
+					// use it. This shouldn't cause any issues for the few items that have
+					// multiple recipes they can be crafted with.
+					$canCraft = false;
+					foreach ($recipes as $r) {
+						$need = $r->getIngredientList();
+						$have = [];
+
+						foreach ($need as $i){
+							foreach ($this->getPickedupItems() as $key => $item) {
+								if ($need == $have) // We already have all the things we need
+									break;
+								if ($item->deepEquals($i, $i->getDamage() !== null, $i->getCompoundTag() !== null)) {
+									$amountRemaining = $item->getCount() - $i->getCount();
+
+									if ($amountRemaining > 0) {
+										$item->setCount($amountRemaining);
+										$have[] = $i;
+									} elseif ($amountRemaining <= 0) {
+										// Relatively safe operation here as items stack
+										$have[] = $item;
+										$this->removePickedupItem($key);
+									}
+								}
+							}
+						}
+						if ($need != $have) {
+							// Can't craft
+							$this->setPickedupItems($pickedupItems);
+							continue;
+						} else {
+							// Reset the recipe to the correct one
+							$recipe = $r;
+							$canCraft = true;
+							$giveItem = false;
+							$this->addPickedupItem(clone $recipe->getResult(), true);
+							break;
+						}
+					}
+				}elseif($recipe instanceof ShapedRecipe){
 					for($x = 0; $x < 3 and $canCraft; ++$x){
 						for($y = 0; $y < 3; ++$y){
 							$item = $packet->input[$y * 3 + $x];
@@ -2878,6 +2919,7 @@ class Player extends Human implements CommandSender, InventoryHolder, ChunkLoade
 				if(!$canCraft or !$recipe->getResult()->deepEquals($result)){
 					$this->server->getLogger()->debug("Unmatched recipe " . $recipe->getId() . " from player " . $this->getName() . ": expected " . $recipe->getResult() . ", got " . $result . ", using: " . implode(", ", $ingredients));
 					$this->inventory->sendContents($this);
+					$this->setPickedupItems($pickedupItems);
 					break;
 				}
 
@@ -2902,6 +2944,7 @@ class Player extends Human implements CommandSender, InventoryHolder, ChunkLoade
 				if(!$canCraft){
 					$this->server->getLogger()->debug("Unmatched recipe " . $recipe->getId() . " from player " . $this->getName() . ": client does not have enough items, using: " . implode(", ", $ingredients));
 					$this->inventory->sendContents($this);
+					$this->setPickedupItems($pickedupItems);
 					break;
 				}
 
@@ -2909,6 +2952,7 @@ class Player extends Human implements CommandSender, InventoryHolder, ChunkLoade
 
 				if($ev->isCancelled()){
 					$this->inventory->sendContents($this);
+					$this->setPickedupItems($pickedupItems);
 					break;
 				}
 
@@ -2929,10 +2973,13 @@ class Player extends Human implements CommandSender, InventoryHolder, ChunkLoade
 					$this->inventory->setItem($slot, $newItem);
 				}
 
-				$extraItem = $this->inventory->addItem($recipe->getResult());
-				if(count($extraItem) > 0){
-					foreach($extraItem as $item){
-						$this->level->dropItem($this, $item);
+				// Avoid item client-sided duplicating in Windows 10 Edition as the item is already created
+				if ($giveItem) {
+					$extraItem = $this->inventory->addItem($recipe->getResult());
+					if(count($extraItem) > 0){
+						foreach($extraItem as $item){
+							$this->level->dropItem($this, $item);
+						}
 					}
 				}
 
@@ -2970,7 +3017,6 @@ class Player extends Human implements CommandSender, InventoryHolder, ChunkLoade
 						$this->awardAchievement("diamond");
 						break;
 				}
-
 				break;
 
 			case ProtocolInfo::CONTAINER_SET_SLOT_PACKET:

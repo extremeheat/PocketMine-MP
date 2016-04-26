@@ -126,6 +126,14 @@ class CraftingManager{
 	}
 
 	/**
+	 * @param Item $item
+	 * @return Recipe[]
+	 */
+	public function getRecipesByItem(Item $item) {
+		return @array_values($this->recipeLookup[$item->getId() . ":" . $item->getDamage()]) ?? [];
+	}
+
+	/**
 	 * @return FurnaceRecipe[]
 	 */
 	public function getFurnaceRecipes(){
